@@ -20,6 +20,9 @@ const state = {
   result: null,           // 当前展示的求解结果
   jobId: null,
   pollTimer: null,
+  vectorJobId: null,      // 当前向量核查任务
+  vectorToken: 0,         // 核查请求代次：改判/换会话后旧响应作废
+  vectorPollTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -73,6 +76,7 @@ function loadSession(payload) {
   state.result = null;
   state.jobId = null;
   if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+  resetVectorCheck("会话已切换，需要重新核查。");
 
   state.images = [];
   for (let i = 0; i < state.nFrames; i++) {
@@ -245,6 +249,7 @@ async function setJudgment(type) {
   const rest = state.judgments.filter((j) => pairKey(j.a, j.b) !== key);
   const next = type ? [...rest, { a, b, type }] : rest;
   invalidateResult(); // 修改即撤下旧结果
+  resetVectorCheck("身份判断已修改，旧核查建议已撤下。");
   try {
     const resp = await api(`/api/sessions/${state.sessionId}/judgments`, {
       method: "PUT",
@@ -254,6 +259,7 @@ async function setJudgment(type) {
     state.version = resp.version;
     state.judgments = next;
     renderJudgments();
+    updateVectorAvailability();
     renderSelection();
     draw();
   } catch (err) {
@@ -265,6 +271,7 @@ async function removeJudgment(a, b) {
   const key = pairKey(a, b);
   const next = state.judgments.filter((j) => pairKey(j.a, j.b) !== key);
   invalidateResult();
+  resetVectorCheck("身份判断已修改，旧核查建议已撤下。");
   try {
     const resp = await api(`/api/sessions/${state.sessionId}/judgments`, {
       method: "PUT",
@@ -274,6 +281,7 @@ async function removeJudgment(a, b) {
     state.version = resp.version;
     state.judgments = next;
     renderJudgments();
+    updateVectorAvailability();
     renderSelection();
     draw();
   } catch (err) {
@@ -314,6 +322,7 @@ async function applyParams() {
     return;
   }
   invalidateResult(); // 修改即撤下旧结果
+  resetVectorCheck("代价参数已修改，旧核查建议已撤下。");
   try {
     const resp = await api(`/api/sessions/${state.sessionId}/params`, {
       method: "PUT",
@@ -324,6 +333,204 @@ async function applyParams() {
     state.params = { w_dist: wDist, w_app: wApp, penalty };
   } catch (err) {
     alert(`保存参数失败：${err.message}`);
+  }
+}
+
+/* ------------------------------------------------------------ 向量核查 */
+
+function resetVectorCheck(message) {
+  // 代次 +1：任何已在途的核查响应/轮询都会因代次不符被丢弃
+  const hadOutput = state.vectorJobId !== null ||
+    $("vector-result").childElementCount > 0;
+  state.vectorToken += 1;
+  state.vectorJobId = null;
+  if (state.vectorPollTimer) {
+    clearTimeout(state.vectorPollTimer);
+    state.vectorPollTimer = null;
+  }
+  $("vector-result").innerHTML = "";
+  const status = $("vector-status");
+  status.classList.add("muted");
+  status.style.color = "";
+  status.textContent = message && hadOutput ? message : "需要先标记同只与异只判断。";
+  updateVectorAvailability();
+}
+
+function updateVectorAvailability() {
+  const same = state.judgments.filter((j) => j.type === "same").length;
+  const diff = state.judgments.filter((j) => j.type === "different").length;
+  const btn = $("vector-btn");
+  btn.disabled = !state.sessionId;
+  if (!state.sessionId) return;
+  if (same === 0 || diff === 0) {
+    const miss = same === 0 && diff === 0 ? "同只与异只" : (same === 0 ? "同只" : "异只");
+    btn.disabled = true;
+    $("vector-status").textContent = `核查需要同时包含同只与异只判断；当前缺少${miss}判断。`;
+  }
+}
+
+async function runVectorCheck() {
+  if (!state.sessionId) return;
+  const status = $("vector-status");
+  status.classList.add("muted");
+  status.style.color = "";
+  $("vector-result").innerHTML = "";
+  const token = ++state.vectorToken;
+  try {
+    const resp = await api(`/api/sessions/${state.sessionId}/vector-check`, { method: "POST" });
+    if (token !== state.vectorToken) return; // 期间已改判或换会话
+    state.vectorJobId = resp.job_id;
+    status.textContent = `核查中（输入版本 v${resp.version}）…`;
+    $("vector-btn").disabled = true;
+    pollVectorJob(resp.job_id, token);
+  } catch (err) {
+    if (token !== state.vectorToken) return;
+    showError("vector-status", err);
+    $("vector-btn").disabled = false;
+  }
+}
+
+async function pollVectorJob(jobId, token) {
+  try {
+    const job = await api(`/api/jobs/${jobId}`);
+    if (token !== state.vectorToken || jobId !== state.vectorJobId) return; // 迟到结果丢弃
+    if (job.status === "running") {
+      state.vectorPollTimer = setTimeout(() => pollVectorJob(jobId, token), 300);
+      return;
+    }
+    state.vectorJobId = null;
+    $("vector-btn").disabled = false;
+    const status = $("vector-status");
+    if (job.status === "error") {
+      status.textContent = job.error || "核查失败。";
+      status.style.color = "#ff9d97";
+      return;
+    }
+    if (job.version !== state.version) {
+      status.textContent =
+        `核查完成，但基于旧输入（v${job.version}，当前 v${state.version}），建议已作废。`;
+      status.style.color = "#ffd887";
+      return;
+    }
+    status.textContent = `核查完成（输入版本 v${job.version}）。`;
+    status.style.color = "";
+    renderVectorResult(job.result);
+  } catch (err) {
+    if (token !== state.vectorToken) return;
+    showError("vector-status", err);
+    $("vector-btn").disabled = false;
+  }
+}
+
+function simLine(j) {
+  return `判断 ${j.a} ↔ ${j.b}（${j.type === "same" ? "同只" : "异只"}）：` +
+    `余弦相似度 ${Number(j.similarity).toFixed(4)}`;
+}
+
+function renderVectorResult(r) {
+  const box = $("vector-result");
+  box.innerHTML = "";
+  if (!r) return;
+
+  const scope = document.createElement("div");
+  scope.className = "muted small";
+  if (r.scope) {
+    scope.textContent =
+      `本次涉及 ${r.scope.boxes} 个框（上限 ${r.scope.max_boxes}）、` +
+      `${r.scope.judgments} 条判断（上限 ${r.scope.max_judgments}）。`;
+  }
+  box.appendChild(scope);
+
+  if (!r.available) {
+    const b = document.createElement("div");
+    b.className = "banner stale";
+    b.textContent = r.message || "不提供重算建议。";
+    box.appendChild(b);
+    if (r.judgments && r.judgments.length) {
+      const ul = document.createElement("ul");
+      ul.className = "sim-list";
+      for (const j of r.judgments) {
+        const li = document.createElement("li");
+        li.textContent = simLine(j);
+        ul.appendChild(li);
+      }
+      box.appendChild(ul);
+    }
+    return;
+  }
+
+  const banner = document.createElement("div");
+  if (r.recommendation === "none") {
+    banner.className = "banner ok";
+    banner.textContent = r.message;
+    box.appendChild(banner);
+  } else if (r.recommendation === "ambiguous") {
+    banner.className = "banner stale";
+    banner.textContent = r.message;
+    box.appendChild(banner);
+  } else {
+    banner.className = "banner stale";
+    banner.textContent = r.message;
+    box.appendChild(banner);
+  }
+
+  const detail = document.createElement("div");
+  detail.className = "vector-detail";
+  if (r.threshold !== null && r.threshold !== undefined) {
+    detail.innerHTML +=
+      `<div>可用阈值：<b>${Number(r.threshold).toFixed(4)}</b>` +
+      `（区间 ${Number(r.threshold_range[0]).toFixed(4)} ~ ${Number(r.threshold_range[1]).toFixed(4)}，` +
+      `间隔 ${Number(r.separation).toFixed(4)}，要求 ≥ ${Number(r.margin_required).toFixed(2)}）</div>`;
+  }
+  if (r.recommendation === "recompute") {
+    detail.innerHTML +=
+      `<div>待重算外观向量的框号：<b>${r.boxes_to_recompute.join("、")}</b>（${r.boxes_to_recompute.length} 个）</div>`;
+    const dropped = r.candidate_sets[0].dropped_judgments || [];
+    if (dropped.length) {
+      detail.innerHTML +=
+        `<div>与待重算框相关、被排除的判断：` +
+        dropped.map((j) =>
+          `${j.a} ↔ ${j.b}（${j.type === "same" ? "同只" : "异只"}，相似度 ${Number(j.similarity).toFixed(4)}）`
+        ).join("；") + "</div>";
+    }
+  }
+  box.appendChild(detail);
+
+  if (!r.unique && r.candidate_sets.length > 1) {
+    const h = document.createElement("h3");
+    h.textContent = `不唯一的候选框集（共 ${r.candidate_sets.length} 组，均为最少重算数）`;
+    box.appendChild(h);
+    r.candidate_sets.forEach((c, i) => {
+      const d = document.createElement("div");
+      d.className = "cand";
+      d.textContent =
+        `候选 ${i + 1}：重算 {${c.boxes_to_recompute.join("、")}}；` +
+        `阈值 ${Number(c.threshold).toFixed(4)}` +
+        `（区间 ${Number(c.threshold_range[0]).toFixed(4)} ~ ${Number(c.threshold_range[1]).toFixed(4)}）` +
+        `，保留同只 ${c.retained_same} 条 / 异只 ${c.retained_different} 条判断。`;
+      box.appendChild(d);
+    });
+  }
+
+  if (r.judgments && r.judgments.length) {
+    const h = document.createElement("h3");
+    h.textContent = "相关判断的余弦相似度";
+    box.appendChild(h);
+    const ul = document.createElement("ul");
+    ul.className = "sim-list";
+    for (const j of r.judgments) {
+      const li = document.createElement("li");
+      li.textContent = simLine(j);
+      li.style.color = j.type === "same" ? "#7ee2a0" : "#ff9d97";
+      ul.appendChild(li);
+    }
+    box.appendChild(ul);
+  }
+  if (r.recommendation !== "none") {
+    const note = document.createElement("div");
+    note.className = "muted small";
+    note.textContent = "提示：核查只依据相似度与人工判断，不认定向量确实有误，也不会自动修改数据。";
+    box.appendChild(note);
   }
 }
 
@@ -441,6 +648,7 @@ function renderAll() {
   banner.textContent = "尚无结果。";
   $("result-summary").innerHTML = "";
   $("trajectory-list").innerHTML = "";
+  updateVectorAvailability();
 }
 
 /* ------------------------------------------------------------ 事件绑定 */
@@ -453,6 +661,7 @@ $("mark-same").addEventListener("click", () => setJudgment("same"));
 $("mark-diff").addEventListener("click", () => setJudgment("different"));
 $("mark-clear").addEventListener("click", () => setJudgment(null));
 $("solve-btn").addEventListener("click", solve);
+$("vector-btn").addEventListener("click", runVectorCheck);
 canvas.addEventListener("click", onCanvasClick);
 for (const id of ["p-wdist", "p-wapp", "p-penalty"]) {
   $(id).addEventListener("change", applyParams);

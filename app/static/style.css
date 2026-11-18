@@ -200,3 +200,27 @@ button.secondary { background: transparent; }
 
 #session-info { font-size: 12px; margin-top: 8px; line-height: 1.6; }
 #solve-status { margin-top: 8px; line-height: 1.6; }
+
+#vector-card p { line-height: 1.6; }
+#vector-status { margin: 8px 0; line-height: 1.6; }
+#vector-result { margin-top: 8px; font-size: 13px; line-height: 1.7; }
+.vector-detail { margin: 6px 0; }
+.vector-detail b { color: #ffd887; }
+.sim-list {
+  list-style: none;
+  margin: 4px 0;
+  padding: 0;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.sim-list li {
+  padding: 2px 6px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.cand {
+  padding: 4px 6px;
+  border-left: 3px solid var(--amber);
+  margin: 4px 0;
+  font-size: 12px;
+}

@@ -181,3 +181,162 @@ def test_unknown_session_404():
 
 def test_healthz():
     assert client.get("/healthz").json() == {"ok": True}
+
+
+# ---------------------------------------------------------------- 向量核查
+
+VECTOR_DETS = [
+    {"id": "a", "frame": 0, "rect": [0, 0, 8, 8], "vector": [1, 0]},
+    {"id": "b", "frame": 1, "rect": [10, 0, 8, 8], "vector": [1, 0]},
+    {"id": "c", "frame": 2, "rect": [20, 0, 8, 8], "vector": [0.97, 0.243]},
+    {"id": "d", "frame": 3, "rect": [30, 0, 8, 8], "vector": [0, 1]},
+    {"id": "e", "frame": 2, "rect": [20, 20, 8, 8], "vector": [1, 0]},
+    {"id": "f", "frame": 3, "rect": [30, 20, 8, 8], "vector": [0, 1]},
+]
+
+
+def make_vector_session(judgments):
+    p = make_session(n_imgs=4, dets=VECTOR_DETS)
+    sid = p["session_id"]
+    r = client.put(f"/api/sessions/{sid}/judgments", json={"judgments": judgments})
+    assert r.status_code == 200, r.text
+    return sid, r.json()["version"]
+
+
+def run_vector_check(sid):
+    job = client.post(f"/api/sessions/{sid}/vector-check").json()
+    return wait_job(job["job_id"]), job
+
+
+def test_vector_check_unique_recompute():
+    sid, version = make_vector_session([
+        {"a": "a", "b": "b", "type": "same"},
+        {"a": "a", "b": "c", "type": "different"},
+        {"a": "e", "b": "f", "type": "different"},
+    ])
+    done, job = run_vector_check(sid)
+    assert job["version"] == version
+    assert done["status"] == "done" and done["result"]["available"]
+    res = done["result"]
+    assert res["recommendation"] == "recompute"
+    assert res["unique"] is True
+    assert res["boxes_to_recompute"] == ["c"]
+    assert len(res["judgments"]) == 3
+    assert all(0.0 <= j["similarity"] <= 1.0 for j in res["judgments"])
+    assert res["threshold"] is not None
+    assert res["separation"] >= 0.05
+
+
+def test_vector_check_already_separable():
+    sid, _ = make_vector_session([
+        {"a": "a", "b": "b", "type": "same"},
+        {"a": "e", "b": "f", "type": "different"},
+    ])
+    done, _ = run_vector_check(sid)
+    res = done["result"]
+    assert res["available"] and res["recommendation"] == "none"
+    assert res["already_separable"] is True
+    assert res["boxes_to_recompute"] == []
+
+
+def test_vector_check_requires_both_types():
+    sid, _ = make_vector_session([{"a": "a", "b": "b", "type": "same"}])
+    done, _ = run_vector_check(sid)
+    res = done["result"]
+    assert res["available"] is False and res["reason"] == "need_both_types"
+    assert res["boxes_to_recompute"] is None
+
+
+def test_vector_check_no_suggestion_when_trajectory_infeasible():
+    p = client.post("/api/example").json()
+    sid = p["session_id"]
+    # A0 与 B0 同帧却标同只 → 轨迹判断本身无解
+    client.put(f"/api/sessions/{sid}/judgments", json={"judgments": [
+        {"a": "A0", "b": "B0", "type": "same"},
+        {"a": "B0", "b": "B1", "type": "different"},
+    ]})
+    done, _ = run_vector_check(sid)
+    res = done["result"]
+    assert res["available"] is False and res["feasible"] is False
+    assert res["reason"] == "trajectory_infeasible"
+    assert res["boxes_to_recompute"] is None
+
+
+def test_vector_check_scope_limit_via_api():
+    dets = [{"id": f"b{i}", "frame": i % 3, "rect": [0, 0, 4, 4],
+             "vector": [1, 0] if i % 2 == 0 else [0, 1]} for i in range(11)]
+    p = make_session(n_imgs=3, dets=dets)
+    sid = p["session_id"]
+    js = [{"a": f"b{2*k}", "b": f"b{2*k+1}", "type": "same"} for k in range(5)]
+    js.append({"a": "b9", "b": "b10", "type": "different"})
+    client.put(f"/api/sessions/{sid}/judgments", json={"judgments": js})
+    done, _ = run_vector_check(sid)
+    res = done["result"]
+    assert res["available"] is False and res["reason"] == "too_many_boxes"
+    assert res["boxes_to_recompute"] is None
+
+
+def test_vector_check_stale_version_reported():
+    """核查期间改判 → 任务结果仍携带旧版本，前端据此丢弃，不覆盖新输入。"""
+    sid, _ = make_vector_session([
+        {"a": "a", "b": "b", "type": "same"},
+        {"a": "e", "b": "f", "type": "different"},
+    ])
+    before = client.get(f"/api/sessions/{sid}").json()["version"]
+    job = client.post(f"/api/sessions/{sid}/vector-check").json()
+    assert job["version"] == before
+    # 立即改判（核查可能已完成，但结果版本仍是旧版本）
+    r = client.put(f"/api/sessions/{sid}/judgments", json={"judgments": [
+        {"a": "a", "b": "b", "type": "same"},
+    ]})
+    assert r.json()["version"] == before + 1
+    done = wait_job(job["job_id"])
+    assert done["version"] == before
+    assert done["version"] != client.get(f"/api/sessions/{sid}").json()["version"]
+
+
+def test_vector_check_ambiguous_reported():
+    dets = [
+        {"id": "a", "frame": 0, "rect": [0, 0, 8, 8], "vector": [1, 0]},
+        {"id": "b", "frame": 1, "rect": [10, 0, 8, 8], "vector": [0.92, 0.391918]},
+        {"id": "c", "frame": 2, "rect": [20, 0, 8, 8], "vector": [1, 0]},
+        {"id": "d", "frame": 3, "rect": [30, 0, 8, 8], "vector": [0.90, 0.435890]},
+        {"id": "e", "frame": 0, "rect": [0, 20, 8, 8], "vector": [1, 0]},
+        {"id": "f", "frame": 1, "rect": [10, 20, 8, 8], "vector": [0, 1]},
+    ]
+    p = make_session(n_imgs=4, dets=dets)
+    sid = p["session_id"]
+    client.put(f"/api/sessions/{sid}/judgments", json={"judgments": [
+        {"a": "a", "b": "b", "type": "same"},
+        {"a": "c", "b": "d", "type": "different"},
+        {"a": "e", "b": "f", "type": "different"},
+    ]})
+    done, _ = run_vector_check(sid)
+    res = done["result"]
+    assert res["available"] is True
+    assert res["recommendation"] == "ambiguous" and res["unique"] is False
+    assert res["boxes_to_recompute"] is None
+    assert {tuple(c["boxes_to_recompute"]) for c in res["candidate_sets"]} == {("c",), ("d",)}
+    for c in res["candidate_sets"]:
+        assert c["retained_same"] >= 1 and c["retained_different"] >= 1
+    assert "不唯一" in res["message"]
+
+
+def test_vector_check_unknown_session_404():
+    assert client.post("/api/sessions/nope/vector-check").status_code == 404
+
+
+def test_vector_check_job_kind_and_local_data():
+    """核查任务不改动会话数据，且返回的框号只来自当前会话。"""
+    sid, _ = make_vector_session([
+        {"a": "a", "b": "b", "type": "same"},
+        {"a": "a", "b": "c", "type": "different"},
+    ])
+    before = client.get(f"/api/sessions/{sid}").json()
+    done, _ = run_vector_check(sid)
+    assert done["kind"] == "vector_check"
+    after = client.get(f"/api/sessions/{sid}").json()
+    assert after == before
+    ids = {d["id"] for d in before["detections"]}
+    for j in done["result"]["judgments"]:
+        assert j["a"] in ids and j["b"] in ids

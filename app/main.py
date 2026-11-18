@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from .example import EXAMPLE_DESCRIPTION, build_example_detections, build_example_frames
 from .solver import InputConflict, solve_tracking
+from .vector_check import analyze_vector_consistency
 
 MAX_FRAMES = 10
 MAX_DETECTIONS = 30
@@ -307,6 +308,67 @@ async def get_job(job_id: str):
     if job is None:
         _err(404, "求解任务不存在。")
     return job
+
+
+# ---------------------------------------------------------------- 向量核查
+
+def _run_vector_job(job_id: str, snapshot: dict):
+    """先按当前判断求轨迹可行性，再核查外观向量一致性。"""
+    try:
+        id_to_idx = {d["id"]: i for i, d in enumerate(snapshot["detections"])}
+        judgments_idx = [
+            {"a": id_to_idx[j["a"]], "b": id_to_idx[j["b"]], "type": j["type"]}
+            for j in snapshot["judgments"]
+        ]
+        solve_res = solve_tracking(
+            snapshot["detections"],
+            judgments_idx,
+            snapshot["params"]["w_dist"],
+            snapshot["params"]["w_app"],
+            snapshot["params"]["penalty"],
+        )
+        analysis = analyze_vector_consistency(
+            snapshot["detections"],
+            snapshot["judgments"],
+            trajectory_feasible=bool(solve_res.get("feasible")),
+            trajectory_message=solve_res.get("message"),
+        )
+        JOBS[job_id].update(status="done", result=analysis)
+    except InputConflict as exc:
+        JOBS[job_id].update(
+            status="done",
+            result=analyze_vector_consistency(
+                snapshot["detections"],
+                snapshot["judgments"],
+                trajectory_feasible=False,
+                trajectory_message=f"无解：{exc}",
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        JOBS[job_id].update(status="error", error=f"向量核查内部错误：{exc}")
+
+
+@app.post("/api/sessions/{sid}/vector-check")
+async def start_vector_check(sid: str):
+    """启动异步向量一致性核查，任务记录当前输入版本。"""
+    sess = _get_session(sid)
+    job_id = uuid.uuid4().hex[:12]
+    snapshot = {
+        "detections": copy.deepcopy(sess["detections"]),
+        "judgments": copy.deepcopy(sess["judgments"]),
+        "params": dict(sess["params"]),
+    }
+    JOBS[job_id] = {
+        "status": "running",
+        "version": sess["version"],
+        "session_id": sid,
+        "kind": "vector_check",
+        "result": None,
+        "error": None,
+    }
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(EXECUTOR, _run_vector_job, job_id, snapshot)
+    return {"job_id": job_id, "version": sess["version"]}
 
 
 # ---------------------------------------------------------------- 页面

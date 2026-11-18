@@ -81,6 +81,18 @@
       <div id="result-summary"></div>
       <div id="trajectory-list"></div>
     </section>
+
+    <section class="card" id="vector-card">
+      <h2>5. 外观向量一致性核查</h2>
+      <p class="muted small" style="margin-top:0">
+        仅核查涉及 ≤10 个框、≤20 条人工判断的片段，且判断须同时包含同只与异只。
+        按余弦相似度寻找能区分同只/异只的阈值（要求间隔 ≥ 0.05）；
+        不能区分时，找出需重算外观向量的最少框集。结果仅供参考，不自动修改任何数据。
+      </p>
+      <button id="vector-btn" class="primary" disabled>核查向量一致性</button>
+      <div id="vector-status" class="muted small">需要先标记同只与异只判断。</div>
+      <div id="vector-result"></div>
+    </section>
   </main>
 </div>
 
